@@ -4,7 +4,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import auth
+from app.routers import analytics, auth, departments, faqs, tickets, users
 
 app = FastAPI(title="DS Connect API")
 
@@ -17,6 +17,11 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(tickets.router)
+app.include_router(faqs.router)
+app.include_router(departments.router)
+app.include_router(analytics.router)
 
 
 @app.get("/api/health")

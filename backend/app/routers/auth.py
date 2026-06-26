@@ -62,9 +62,11 @@ async def request_otp(body: RequestOTPBody) -> dict[str, str]:
         await send_otp_email(email, raw_otp)
     except Exception as exc:
         await db.otps.delete_one({"email": email})
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to send OTP email",
+            detail=f"Failed to send OTP email: {str(exc)}",
         ) from exc
 
     return {"message": "OTP sent"}
@@ -102,14 +104,39 @@ async def verify_otp_endpoint(body: VerifyOTPBody) -> TokenResponse:
 
     user = await db.users.find_one({"email": email})
     if user:
-        user_id = str(user["_id"])
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"last_login": now}},
+        )
+        user = await db.users.find_one({"_id": user["_id"]})
     else:
         insert_result = await db.users.insert_one(
-            {"email": email, "created_at": now}
+            {
+                "email": email,
+                "role": "employee",
+                "created_at": now,
+                "last_login": now,
+            }
         )
-        user_id = str(insert_result.inserted_id)
+        user = await db.users.find_one({"_id": insert_result.inserted_id})
 
-    token_payload = {"sub": user_id, "email": email}
+    user_id = str(user["_id"])
+    role = user.get("role", "employee")
+    department_id = user.get("department_id")
+    user_response = {
+        "id": user_id,
+        "email": user["email"],
+        "name": user.get("name"),
+        "role": role,
+        "department_id": str(department_id) if department_id else None,
+    }
+
+    token_payload = {
+        "sub": user_id,
+        "user_id": user_id,
+        "email": email,
+        "role": role,
+    }
     access_token = create_access_token(token_payload)
     refresh_token = create_refresh_token(token_payload)
 
@@ -117,4 +144,5 @@ async def verify_otp_endpoint(body: VerifyOTPBody) -> TokenResponse:
         access_token=access_token,
         refresh_token=refresh_token,
         token_type="bearer",
+        user=user_response,
     )
