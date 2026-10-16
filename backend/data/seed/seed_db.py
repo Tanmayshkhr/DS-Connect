@@ -11,7 +11,15 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 # Load .env from backend root (two levels up from this file)
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR / ".env")
+
+from app.models.audit_log import AuditLogInDB
+from app.models.comment import CommentInDB
+from app.models.department import DepartmentInDB
+from app.models.faq import FAQInDB
+from app.models.ticket import TicketInDB
+from app.models.user import UserInDB
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = "ds_connect"
@@ -20,7 +28,28 @@ DB_NAME = "ds_connect"
 # Static data
 # ---------------------------------------------------------------------------
 
-DEPARTMENT_NAMES = ["IT", "Finance", "HR", "Operations"]
+DEPARTMENTS = [
+    {
+        "name": "IT",
+        "code": "IT",
+        "description": "Technology support, infrastructure, access, and software services.",
+    },
+    {
+        "name": "Finance",
+        "code": "FIN",
+        "description": "Payroll, reimbursements, invoices, and finance operations.",
+    },
+    {
+        "name": "HR",
+        "code": "HR",
+        "description": "People operations, employee policy, onboarding, and performance workflows.",
+    },
+    {
+        "name": "Operations",
+        "code": "OPS",
+        "description": "Facilities, access cards, meeting rooms, and workplace operations.",
+    },
+]
 
 EMPLOYEE_USERS = [
     ("Aarav Sharma",     "aarav.sharma"),
@@ -90,7 +119,7 @@ COMMENT_TEXTS = [
     "Escalating as the deadline is approaching.",
     "I will be available for a call if needed.",
     "Same issue is faced by my colleague as well.",
-    "Checked with IT helpdesk — they suggested raising a ticket.",
+    "Checked with IT helpdesk - they suggested raising a ticket.",
     "Tried the suggested fix but it did not work.",
     "The problem reappeared after the last system update.",
     "Requesting closure as this is no longer blocking me.",
@@ -168,6 +197,20 @@ def random_past_datetime(days=30):
     return now_utc() - timedelta(minutes=delta)
 
 
+def validate_docs(model, docs):
+    allowed_fields = {
+        field.alias or name
+        for name, field in model.model_fields.items()
+    }
+    for doc in docs:
+        extra_fields = set(doc) - allowed_fields
+        if extra_fields:
+            raise ValueError(
+                f"{model.__name__} seed doc has unknown fields: {sorted(extra_fields)}"
+            )
+        model.model_validate(doc)
+
+
 # ---------------------------------------------------------------------------
 # Main seed function
 # ---------------------------------------------------------------------------
@@ -183,7 +226,19 @@ async def seed():
     # -----------------------------------------------------------------------
     # Departments
     # -----------------------------------------------------------------------
-    dept_docs = [{"_id": ObjectId(), "name": name} for name in DEPARTMENT_NAMES]
+    dept_docs = [
+        {
+            "_id": ObjectId(),
+            "name": dept["name"],
+            "code": dept["code"],
+            "description": dept["description"],
+            "is_active": True,
+            "created_at": now_utc(),
+            "updated_at": None,
+        }
+        for dept in DEPARTMENTS
+    ]
+    validate_docs(DepartmentInDB, dept_docs)
     await db["departments"].insert_many(dept_docs)
     dept_ids = [d["_id"] for d in dept_docs]
 
@@ -205,36 +260,65 @@ async def seed():
     user_docs.append(admin_doc)
 
     employee_docs = []
-    for name, handle in EMPLOYEE_USERS:
+    resolver_docs = []
+    dept_admin_docs = []
+    for index, (name, handle) in enumerate(EMPLOYEE_USERS):
+        department_id = dept_ids[index % len(dept_ids)]
+        if index < len(dept_ids):
+            role = "resolver"
+        elif index < len(dept_ids) * 2:
+            role = "dept_admin"
+        else:
+            role = "employee"
+
         doc = {
             "_id": ObjectId(),
             "email": f"{handle}@dsgroup.com",
             "name": name,
-            "role": "employee",
-            "department_id": None,
+            "role": role,
+            "department_id": department_id,
             "is_active": True,
             "created_at": now_utc(),
             "updated_at": None,
         }
         user_docs.append(doc)
-        employee_docs.append(doc)
+        if role == "resolver":
+            resolver_docs.append(doc)
+        elif role == "dept_admin":
+            dept_admin_docs.append(doc)
+        else:
+            employee_docs.append(doc)
 
+    validate_docs(UserInDB, user_docs)
     await db["users"].insert_many(user_docs)
 
     # -----------------------------------------------------------------------
     # Tickets
     # -----------------------------------------------------------------------
-    statuses = ["open", "in_progress", "resolved", "closed"]
+    statuses = ["open", "assigned", "in_progress", "resolved", "closed", "overdue"]
     priorities = ["low", "medium", "high", "critical"]
-    categories = ["technical", "hr", "finance", "admin", "general"]
+    categories = ["software", "hardware", "network", "payroll", "access", "operations", "other"]
 
     ticket_docs = []
     for i in range(30):
         status = random.choice(statuses)
         created_at = random_past_datetime(30)
         resolved_at = None
+        closed_at = None
         if status in ("resolved", "closed"):
             resolved_at = created_at + timedelta(hours=random.randint(2, 48))
+        if status == "closed":
+            closed_at = resolved_at + timedelta(hours=random.randint(1, 12))
+
+        department_id = random.choice(dept_ids)
+        department_resolvers = [
+            resolver
+            for resolver in resolver_docs
+            if resolver["department_id"] == department_id
+        ]
+        assigned_resolver_id = None
+        if status in ("assigned", "in_progress", "resolved", "closed", "overdue"):
+            assigned_resolver_id = random.choice(department_resolvers)["_id"]
 
         doc = {
             "_id": ObjectId(),
@@ -243,15 +327,17 @@ async def seed():
             "category": random.choice(categories),
             "priority": random.choice(priorities),
             "status": status,
-            "raised_by": random.choice(employee_docs)["email"],
-            "department_id": random.choice(dept_ids),
-            "assigned_to": None,
+            "raised_by": random.choice(employee_docs)["_id"],
+            "department_id": department_id,
+            "assigned_resolver_id": assigned_resolver_id,
             "created_at": created_at,
-            "resolved_at": resolved_at,
             "updated_at": None,
+            "resolved_at": resolved_at,
+            "closed_at": closed_at,
         }
         ticket_docs.append(doc)
 
+    validate_docs(TicketInDB, ticket_docs)
     await db["tickets"].insert_many(ticket_docs)
 
     # -----------------------------------------------------------------------
@@ -264,13 +350,14 @@ async def seed():
         doc = {
             "_id": ObjectId(),
             "ticket_id": ticket["_id"],
-            "author_id": author["_id"],
-            "text": COMMENT_TEXTS[i],
+            "body": COMMENT_TEXTS[i],
             "is_internal": False,
+            "created_by": author["_id"],
             "created_at": ticket["created_at"] + timedelta(hours=random.randint(1, 10)),
         }
         comment_docs.append(doc)
 
+    validate_docs(CommentInDB, comment_docs)
     await db["comments"].insert_many(comment_docs)
 
     # -----------------------------------------------------------------------
@@ -278,21 +365,31 @@ async def seed():
     # -----------------------------------------------------------------------
     faq_docs = []
     for faq in FAQ_DATA:
-        suggester = random.choice(employee_docs)
+        creator = random.choice(resolver_docs)
+        created_at = random_past_datetime(20)
         is_published = faq["status"] == "published"
         doc = {
             "_id": ObjectId(),
             "question": faq["question"],
             "answer": faq["answer"],
             "status": faq["status"],
-            "department_id": random.choice(dept_ids),
-            "suggested_by": suggester["_id"],
+            "department_id": creator["department_id"],
+            "created_by": creator["_id"],
             "reviewed_by": None,
-            "approved_by": None,
-            "created_at": now_utc(),
+            "approved_by": admin_doc["_id"] if is_published else None,
+            "rejected_by": None,
+            "keywords": [],
+            "review_notes": None,
+            "rejection_reason": None,
+            "created_at": created_at,
+            "updated_at": None,
+            "reviewed_at": None,
+            "approved_at": created_at + timedelta(days=random.randint(1, 5)) if is_published else None,
+            "rejected_at": None,
         }
         faq_docs.append(doc)
 
+    validate_docs(FAQInDB, faq_docs)
     await db["faqs"].insert_many(faq_docs)
 
     # -----------------------------------------------------------------------
@@ -302,32 +399,35 @@ async def seed():
     for ticket in ticket_docs:
         doc = {
             "_id": ObjectId(),
-            "action": "created",
+            "action": "ticket_created",
             "actor_id": ticket["raised_by"],
-            "resource": "ticket",
-            "resource_id": ticket["_id"],
-            "detail": {
+            "entity_type": "ticket",
+            "entity_id": ticket["_id"],
+            "metadata": {
                 "title": ticket["title"],
+                "category": ticket["category"],
+                "priority": ticket["priority"],
                 "department_id": str(ticket["department_id"]),
             },
-            "timestamp": ticket["created_at"],
+            "created_at": ticket["created_at"],
         }
         audit_docs.append(doc)
 
+    validate_docs(AuditLogInDB, audit_docs)
     await db["audit_logs"].insert_many(audit_docs)
 
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
-    print("\n── Seed complete ──────────────────────────────")
+    print("\n-- Seed complete ------------------------------")
     print(f"  departments : {len(dept_docs)}")
-    print(f"  users       : {len(user_docs)}  (1 system_admin + {len(employee_docs)} employees)")
+    print(f"  users       : {len(user_docs)}  (1 system_admin + {len(resolver_docs)} resolvers + {len(dept_admin_docs)} dept_admins + {len(employee_docs)} employees)")
     print(f"  tickets     : {len(ticket_docs)}")
     print(f"  comments    : {len(comment_docs)}")
     print(f"  faqs        : {len(faq_docs)}  (5 published + 5 suggested)")
     print(f"  audit_logs  : {len(audit_docs)}")
     print(f"  otps        : 0  (collection dropped and left empty)")
-    print("───────────────────────────────────────────────\n")
+    print("-----------------------------------------------\n")
 
     client.close()
 

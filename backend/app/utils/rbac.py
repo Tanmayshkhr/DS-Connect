@@ -37,6 +37,12 @@ async def get_current_user(
     if not user:
         raise credentials_exception
 
+    if user.get("is_active") is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account deactivated. Contact your system admin.",
+        )
+
     return UserInDB.model_validate(user)
 
 

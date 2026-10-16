@@ -18,7 +18,7 @@ export default function SplashPreview() {
     const t = (fn, ms) => timers.current.push(setTimeout(fn, ms));
     
     // Animation Timeline
-    t(() => setStage("wordmark"), 150);
+    t(() => setStage("wordmark"), 300);
     t(() => setStage("combine"),  600);
     t(() => setStage("flood"),   1500);
     t(() => setStage("white"),   2500);

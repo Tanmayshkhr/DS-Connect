@@ -37,7 +37,7 @@ export default function OtpVerifyPage() {
 
     try {
       const data = await verifyOtp(email, otp);
-      login(data.access_token, data.refresh_token);
+      login(data.access_token, data.refresh_token, data.user);
       navigate('/dashboard');
     } catch {
       setError('Invalid or expired OTP.');

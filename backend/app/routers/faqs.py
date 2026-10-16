@@ -156,6 +156,10 @@ async def list_faqs(
     - resolver      → suggested + published FAQs in their department
     - dept_admin    → suggested + reviewed FAQs in their department
     - system_admin  → all FAQs across all departments and statuses
+
+    All four actor fields (created_by, reviewed_by, approved_by, rejected_by)
+    are resolved to human-readable name/email via $lookup so the frontend never
+    shows raw ObjectId strings.
     """
     role = _role_value(current_user)
 
@@ -166,33 +170,61 @@ async def list_faqs(
     )
 
     if role == RoleEnum.employee.value:
-        filt = {"status": FAQStatusEnum.published.value}
+        match_stage = {"status": FAQStatusEnum.published.value}
 
     elif role == RoleEnum.resolver.value:
-        filt = {
+        match_stage = {
             "status": {"$in": [
                 FAQStatusEnum.suggested.value,
                 FAQStatusEnum.published.value,
             ]},
         }
         if dept_oid:
-            filt["department_id"] = dept_oid
+            match_stage["department_id"] = dept_oid
 
     elif role == RoleEnum.dept_admin.value:
-        filt = {
+        match_stage = {
             "status": {"$in": [
                 FAQStatusEnum.suggested.value,
                 FAQStatusEnum.reviewed.value,
             ]},
         }
         if dept_oid:
-            filt["department_id"] = dept_oid
+            match_stage["department_id"] = dept_oid
 
     else:
         # system_admin — no filter
-        filt = {}
+        match_stage = {}
 
-    faqs = await db.faqs.find(filt).sort("created_at", -1).to_list(length=None)
+    def _user_lookup(from_field: str, alias: str) -> list[dict]:
+        """Build a $lookup + $unwind pair for a single actor field."""
+        return [
+            {
+                "$lookup": {
+                    "from": "users",
+                    "localField": from_field,
+                    "foreignField": "_id",
+                    "as": alias,
+                }
+            },
+            {
+                "$unwind": {
+                    "path": f"${alias}",
+                    "preserveNullAndEmptyArrays": True,
+                }
+            },
+        ]
+
+    pipeline: list[dict] = [
+        {"$match": match_stage},
+        {"$sort": {"created_at": -1}},
+        *_user_lookup("created_by",  "_created_by_user"),
+        *_user_lookup("reviewed_by", "_reviewed_by_user"),
+        *_user_lookup("approved_by", "_approved_by_user"),
+        *_user_lookup("rejected_by", "_rejected_by_user"),
+    ]
+
+    faqs = await db.faqs.aggregate(pipeline).to_list(length=None)
     return [_serialize_faq(f) for f in faqs]
 
 
@@ -219,6 +251,18 @@ async def review_faq(
         )
 
     faq = await _get_faq_or_404(faq_id)
+
+    # dept_admin may only review FAQs belonging to their own department
+    admin_dept_oid = (
+        _oid(str(current_user.department_id))
+        if current_user.department_id
+        else None
+    )
+    if not admin_dept_oid or faq["department_id"] != admin_dept_oid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="dept_admin can only review FAQs in their own department",
+        )
 
     if faq["status"] != FAQStatusEnum.suggested.value:
         raise HTTPException(
@@ -332,6 +376,19 @@ async def reject_faq(
         )
 
     faq = await _get_faq_or_404(faq_id)
+
+    # dept_admin may only reject FAQs in their own department
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or faq["department_id"] != admin_dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only reject FAQs in their own department",
+            )
 
     # Cannot reject an already-published or already-rejected FAQ
     non_rejectable = {

@@ -59,6 +59,8 @@ class TicketInDB(BaseModel):
     updated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
+    is_delayed: bool = False
+    delay_reason: Optional[str] = None
 
 
 class TicketResponse(BaseModel):
@@ -75,6 +77,8 @@ class TicketResponse(BaseModel):
     updated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
+    is_delayed: bool = False
+    delay_reason: Optional[str] = None
 
 
 class TicketUpdate(BaseModel):

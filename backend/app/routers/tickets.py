@@ -35,6 +35,28 @@ def _oid(value: str) -> ObjectId:
     )
 
 
+def _to_utc_iso(dt) -> str | None:
+    """
+    Convert a datetime returned by Motor to an ISO-8601 string with an explicit
+    UTC offset (e.g. "2026-07-23T06:51:55+00:00").
+
+    Motor's AsyncIOMotorClient without tz_aware=True returns *naive* datetime
+    objects even though the values stored in MongoDB are UTC.  Python's
+    datetime.isoformat() on a naive datetime omits any timezone suffix,
+    producing e.g. "2026-07-23T06:51:55".  JavaScript's new Date() treats a
+    no-suffix ISO string as *local* time, not UTC — causing timestamps to appear
+    shifted by the server/browser timezone offset (e.g. 5 h 30 min on IST).
+
+    This helper re-attaches UTC tzinfo before serialising so the wire format
+    is always unambiguous.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
 def _serialize_ticket(t: dict) -> dict:
     return {
         "id": str(t["_id"]),
@@ -50,10 +72,12 @@ def _serialize_ticket(t: dict) -> dict:
             if t.get("assigned_resolver_id")
             else None
         ),
-        "created_at": t.get("created_at"),
-        "updated_at": t.get("updated_at"),
-        "resolved_at": t.get("resolved_at"),
-        "closed_at": t.get("closed_at"),
+        "created_at": _to_utc_iso(t.get("created_at")),
+        "updated_at": _to_utc_iso(t.get("updated_at")),
+        "resolved_at": _to_utc_iso(t.get("resolved_at")),
+        "closed_at": _to_utc_iso(t.get("closed_at")),
+        "is_delayed": t.get("is_delayed", False),
+        "delay_reason": t.get("delay_reason"),
     }
 
 
@@ -64,7 +88,7 @@ def _serialize_comment(c: dict) -> dict:
         "body": c["body"],
         "is_internal": c.get("is_internal", False),
         "created_by": str(c["created_by"]),
-        "created_at": c.get("created_at"),
+        "created_at": _to_utc_iso(c.get("created_at")),
     }
 
 
@@ -131,6 +155,8 @@ async def create_ticket(
         "updated_at": None,
         "resolved_at": None,
         "closed_at": None,
+        "is_delayed": False,
+        "delay_reason": None,
     }
 
     result = await db.tickets.insert_one(doc)
@@ -199,7 +225,10 @@ async def list_tickets(
     elif role == RoleEnum.dept_admin.value:
         if dept_oid:
             base_filter["department_id"] = dept_oid
-        # system_admin sees everything — no additional filter
+        else:
+            # dept_admin with no department assigned — return nothing rather
+            # than falling through to an empty filter that exposes all tickets.
+            base_filter["department_id"] = None  # matches zero documents
 
     # Apply optional query filters on top
     if ticket_status:
@@ -290,6 +319,29 @@ async def update_ticket_status(
         )
 
     ticket = await _get_ticket_or_404(ticket_id)
+    user_oid = _oid(current_user.id)
+
+    # dept_admin may only update tickets belonging to their own department
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or ticket["department_id"] != admin_dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only update status of tickets in their own department",
+            )
+
+    # resolver may only update status of tickets explicitly assigned to them
+    elif role == RoleEnum.resolver.value:
+        if ticket.get("assigned_resolver_id") != user_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="resolver can only update status of tickets assigned to them",
+            )
+
     now = datetime.now(timezone.utc)
     old_status = ticket["status"]
     new_status = body.status.value
@@ -346,6 +398,19 @@ async def assign_ticket(
     ticket = await _get_ticket_or_404(ticket_id)
     resolver_oid = _oid(body.resolver_id)
 
+    # dept_admin may only assign tickets in their own department
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or ticket["department_id"] != admin_dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only assign tickets in their own department",
+            )
+
     # Verify the resolver exists and actually has the resolver role
     resolver = await db.users.find_one({"_id": resolver_oid})
     if not resolver:
@@ -387,6 +452,73 @@ async def assign_ticket(
 
 
 # ---------------------------------------------------------------------------
+# PATCH /tickets/{ticket_id}/delay — flag a ticket as delayed (resolver only)
+# ---------------------------------------------------------------------------
+
+class DelayBody(BaseModel):
+    is_delayed: bool = True
+    delay_reason: str
+
+
+@router.patch("/{ticket_id}/delay")
+async def flag_ticket_delayed(
+    ticket_id: str,
+    body: DelayBody,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+) -> dict:
+    """Resolver can flag a ticket they own as delayed (or clear the flag)."""
+    role = _role_value(current_user)
+    if role != RoleEnum.resolver.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only resolvers can flag tickets as delayed",
+        )
+
+    ticket = await _get_ticket_or_404(ticket_id)
+    user_oid = _oid(current_user.id)
+
+    # Ownership check — resolver must be assigned to this ticket
+    if ticket.get("assigned_resolver_id") != user_oid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only flag tickets assigned to you as delayed",
+        )
+
+    if body.is_delayed and not body.delay_reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A non-empty delay_reason is required when flagging as delayed",
+        )
+
+    now = datetime.now(timezone.utc)
+    updates: dict = {
+        "is_delayed": body.is_delayed,
+        "delay_reason": body.delay_reason.strip() if body.is_delayed else None,
+        "updated_at": now,
+    }
+
+    await db.tickets.update_one(
+        {"_id": ticket["_id"]},
+        {"$set": updates},
+    )
+
+    await _insert_audit_log(
+        action=ActionEnum.ticket_delayed,
+        actor_id=user_oid,
+        entity_type="ticket",
+        entity_id=ticket["_id"],
+        metadata={
+            "is_delayed": body.is_delayed,
+            "delay_reason": body.delay_reason.strip() if body.is_delayed else None,
+            "title": ticket["title"],
+        },
+    )
+
+    updated = await db.tickets.find_one({"_id": ticket["_id"]})
+    return _serialize_ticket(updated)
+
+
+# ---------------------------------------------------------------------------
 # POST /tickets/{ticket_id}/comments — add a comment
 # ---------------------------------------------------------------------------
 
@@ -408,6 +540,29 @@ async def add_comment(
     ticket = await _get_ticket_or_404(ticket_id)
 
     role = _role_value(current_user)
+    user_oid = _oid(current_user.id)
+
+    # dept_admin may only comment on tickets in their own department
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or ticket["department_id"] != admin_dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only comment on tickets in their own department",
+            )
+
+    # resolver may only comment on tickets explicitly assigned to them
+    elif role == RoleEnum.resolver.value:
+        if ticket.get("assigned_resolver_id") != user_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="resolver can only comment on tickets assigned to them",
+            )
+
     privileged_roles = {
         RoleEnum.resolver.value,
         RoleEnum.dept_admin.value,
@@ -416,7 +571,6 @@ async def add_comment(
     is_internal = body.is_internal if role in privileged_roles else False
 
     now = datetime.now(timezone.utc)
-    user_oid = _oid(current_user.id)
 
     doc = {
         "ticket_id": ticket["_id"],
@@ -456,6 +610,20 @@ async def list_comments(
     ticket = await _get_ticket_or_404(ticket_id)
 
     role = _role_value(current_user)
+
+    # dept_admin may only list comments on tickets in their own department
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or ticket["department_id"] != admin_dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only list comments on tickets in their own department",
+            )
+
     privileged_roles = {
         RoleEnum.resolver.value,
         RoleEnum.dept_admin.value,

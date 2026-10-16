@@ -176,6 +176,20 @@ async def department_stats(
             detail="Department not found",
         )
 
+    # dept_admin may only view stats for their own department
+    role = _role_value(current_user)
+    if role == RoleEnum.dept_admin.value:
+        admin_dept_oid = (
+            _oid(str(current_user.department_id))
+            if current_user.department_id
+            else None
+        )
+        if not admin_dept_oid or admin_dept_oid != dept_oid:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="dept_admin can only view stats for their own department",
+            )
+
     pipeline = [
         {"$match": {"department_id": dept_oid}},
         {"$group": {"_id": "$status", "count": {"$sum": 1}}},
@@ -194,3 +208,51 @@ async def department_stats(
         "closed": counts.get("closed", 0),
         "total": sum(counts.values()),
     }
+
+
+# ---------------------------------------------------------------------------
+# DELETE /departments/{dept_id} — system_admin only
+# ---------------------------------------------------------------------------
+
+@router.delete("/{dept_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_department(
+    dept_id: str,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+) -> None:
+    """
+    Permanently delete a department.
+
+    Blocked (HTTP 400) if any users are still assigned to it or any tickets
+    still reference it — the caller must reassign those records first.
+    """
+    _require_roles(current_user, RoleEnum.system_admin.value)
+
+    dept_oid = _oid(dept_id)
+    dept = await db.departments.find_one({"_id": dept_oid})
+    if not dept:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Department not found",
+        )
+
+    # Safety check 1 — users assigned to this department
+    user_count = await db.users.count_documents({"department_id": dept_oid})
+
+    # Safety check 2 — tickets that reference this department
+    ticket_count = await db.tickets.count_documents({"department_id": dept_oid})
+
+    if user_count > 0 or ticket_count > 0:
+        parts = []
+        if user_count:
+            parts.append(f"{user_count} user{'s' if user_count != 1 else ''}")
+        if ticket_count:
+            parts.append(f"{ticket_count} ticket{'s' if ticket_count != 1 else ''}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot delete department with active users/tickets — "
+                f"reassign them first ({', '.join(parts)} still linked)."
+            ),
+        )
+
+    await db.departments.delete_one({"_id": dept_oid})

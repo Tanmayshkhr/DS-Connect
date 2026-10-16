@@ -20,6 +20,9 @@ class ActionEnum(str, Enum):
     user_deactivated = "user_deactivated"
     department_created = "department_created"
     department_updated = "department_updated"
+    new_user_pending_setup = "new_user_pending_setup"
+    user_onboarded = "user_onboarded"
+    ticket_delayed = "ticket_delayed"
 
 
 class AuditLogCreate(BaseModel):

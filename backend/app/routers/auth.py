@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 
 from app.database import db
+from app.models.audit_log import ActionEnum
 from app.models.user import TokenResponse
 from app.utils.email import send_otp_email
 from app.utils.jwt import create_access_token, create_refresh_token
@@ -104,6 +105,11 @@ async def verify_otp_endpoint(body: VerifyOTPBody) -> TokenResponse:
 
     user = await db.users.find_one({"email": email})
     if user:
+        if user.get("is_active") is False:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account deactivated. Contact your system admin.",
+            )
         await db.users.update_one(
             {"_id": user["_id"]},
             {"$set": {"last_login": now}},
@@ -119,6 +125,23 @@ async def verify_otp_endpoint(body: VerifyOTPBody) -> TokenResponse:
             }
         )
         user = await db.users.find_one({"_id": insert_result.inserted_id})
+
+        # Notify system_admin that a new user needs role + department assignment.
+        # actor_id == entity_id == the new user's own _id (no other actor exists).
+        await db.audit_logs.insert_one(
+            {
+                "action": ActionEnum.new_user_pending_setup.value,
+                "actor_id": insert_result.inserted_id,
+                "entity_type": "user",
+                "entity_id": insert_result.inserted_id,
+                "metadata": {
+                    "user_id": str(insert_result.inserted_id),
+                    "email": email,
+                    "created_at": now.isoformat(),
+                },
+                "created_at": now,
+            }
+        )
 
     user_id = str(user["_id"])
     role = user.get("role", "employee")
